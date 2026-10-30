@@ -1,0 +1,14 @@
+# SECRETS: kabhi commit mat karo
+.env
+data/
+*.session
+*.session-journal
+
+# runtime
+downloads/
+venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm

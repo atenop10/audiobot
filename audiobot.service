@@ -1,0 +1,13 @@
+[Unit]
+Description=Audio relay bot
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/audiobot
+ExecStart=/opt/audiobot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
