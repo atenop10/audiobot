@@ -25,6 +25,14 @@ WEBHOOK_PORT = int(E("WEBHOOK_PORT", "8080"))
 FIRST_REPLY_TIMEOUT = int(E("FIRST_REPLY_TIMEOUT", "30"))
 IDLE_TIMEOUT = int(E("IDLE_TIMEOUT", "10"))
 VIEW_TTL = int(E("VIEW_TTL", "21600"))
+EP_WAIT = int(E("EP_WAIT", "90"))                    # audio aane tak max wait (status msg ke baad)
+GRACE = 3                                            # "Process Finished" ke baad bachi msgs ka wait
+# target bot ke ye buttons group me nahi dikhaye jate (userbot ka shared state bigad deta hai)
+HIDE_BUTTONS = [x.strip().lower() for x in E(
+    "HIDE_BUTTONS", "Mode:,Edit Caption,कहानी सहेजें,मुख्य मेनू,Main Menu").split(",") if x.strip()]
+FINISH_RE = re.compile(r"Process Finished", re.I)
+RANGE_RE = re.compile(r"Out of Range", re.I)
+TOTAL_RE = re.compile(r"Total Episodes Available:\s*(\d+)", re.I)
 LINK_VALID_MIN = 30
 
 TERMS = (
@@ -174,7 +182,9 @@ async def collect(event):
         await incoming.put(event.message)
 
 
-async def run_step(action, on_new=None):
+async def run_step(action, on_new=None, stop=None, idle=None):
+    """action chalao, target bot ke reply collect karo.
+    stop(msg) True de to GRACE sec aur ruk ke band. idle = pehle reply ke baad ka wait."""
     global incoming
     incoming = asyncio.Queue()
     order, byid = [], {}
@@ -189,13 +199,16 @@ async def run_step(action, on_new=None):
                 msg = await asyncio.wait_for(incoming.get(), timeout)
             except asyncio.TimeoutError:
                 break
-            timeout = IDLE_TIMEOUT
+            timeout = idle or IDLE_TIMEOUT
             is_new = msg.id not in byid
             if is_new:
                 order.append(msg.id)
             byid[msg.id] = msg
             if is_new and on_new:
                 await on_new(msg)
+            if stop and stop(msg):
+                stop = None
+                timeout = GRACE
     finally:
         incoming = None
     return [byid[i] for i in order]
@@ -228,9 +241,15 @@ async def goto(path):
 
 
 # ======================= VIEWS (search / buttons) =======================
+def is_hidden(text):
+    t = (text or "").lower()
+    return any(h in t for h in HIDE_BUTTONS)
+
+
 def make_items(msgs):
     return [{"text": m.text or "",
-             "buttons": [[{"t": b.text, "u": b.url or None} for b in row] for row in (m.buttons or [])]}
+             "buttons": [[{"t": b.text, "u": b.url or None, "h": is_hidden(b.text)} for b in row]
+                         for row in (m.buttons or [])]}
             for m in msgs]
 
 
@@ -245,12 +264,17 @@ async def render(chat, hid, uid, reply_to):
             for i, row in enumerate(it["buttons"]):
                 r = []
                 for j, b in enumerate(row):
+                    if b.get("h"):
+                        continue
                     if b["u"]:
                         r.append(Button.url(b["t"], b["u"]))
                     else:
                         r.append(Button.inline(b["t"], f"b:{hid}:{k}:{i}:{j}:{uid}".encode()))
-                btns.append(r)
-        sent = await bot.send_message(chat, it["text"] or "…", buttons=btns, reply_to=reply_to)
+                if r:
+                    btns.append(r)
+        if not it["text"] and not btns:
+            continue
+        sent = await bot.send_message(chat, it["text"] or "…", buttons=btns or None, reply_to=reply_to)
         with db:
             db.execute("INSERT OR REPLACE INTO menus(key,hid) VALUES(?,?)", (f"{chat}:{sent.id}", hid))
 
@@ -299,32 +323,40 @@ def cached_fids(hid, n):
 
 
 async def fetch_episode(chat, hid, n, reply_to):
-    fids = []
+    """Return (ok, total). total = target bot ne kitne episodes bataye (out of range par)."""
+    fids, info = [], {"total": None}
 
     async def on_new(msg):
+        txt = msg.text or ""
         if msg.media and not getattr(msg.media, "webpage", None):
             p = await userbot.download_media(msg, file="downloads/")
             try:
                 sent = await bot.send_file(
-                    chat, p, caption=msg.text or "", reply_to=reply_to, voice_note=bool(msg.voice),
+                    chat, p, caption=txt, reply_to=reply_to, voice_note=bool(msg.voice),
                     attributes=msg.document.attributes if msg.document else None)
                 fids.append(sent.file.id)
             finally:
                 if p and os.path.exists(p):
                     os.remove(p)
-        elif msg.text:
-            await bot.send_message(chat, msg.text, reply_to=reply_to)
+        elif RANGE_RE.search(txt):
+            m = TOTAL_RE.search(txt)
+            info["total"] = int(m[1]) if m else 0
+        # baaki target ke status / "Process Finished" msgs group me forward nahi karte
 
-    await run_step(lambda: userbot.send_message(TARGET_BOT, str(n)), on_new)
+    def stop(msg):
+        t = msg.text or ""
+        return bool(FINISH_RE.search(t) or RANGE_RE.search(t))
+
+    await run_step(lambda: userbot.send_message(TARGET_BOT, str(n)), on_new, stop, idle=EP_WAIT)
     if fids:
         with db:
             db.execute("INSERT OR REPLACE INTO eps(key,fids) VALUES(?,?)", (f"{hid}:{n}", json.dumps(fids)))
-    return bool(fids)
+    return bool(fids), info["total"]
 
 
 def make_job(job_id, chat, uid, hid, nums, path, reply_to):
     async def job():
-        ok, moved = 0, False
+        ok, moved, missing, total = 0, False, [], None
         try:
             for n in nums:
                 fids = cached_fids(hid, n)
@@ -336,12 +368,19 @@ def make_job(job_id, chat, uid, hid, nums, path, reply_to):
                     if not moved:
                         await goto(path)
                         moved = True
-                    ok += await fetch_episode(chat, hid, n, reply_to)
+                    got, tot = await fetch_episode(chat, hid, n, reply_to)
+                    ok += got
+                    if not got:
+                        missing.append(n)
+                        total = tot if tot is not None else total
         finally:
             finish_job(job_id, uid, ok, len(nums))
         msg = f"✅ Done ({ok}/{len(nums)} mile). Balance: {rs(bal(uid))}"
         if ok < len(nums):
             msg += f"\n↩️ {len(nums) - ok} episode ka paisa wallet me wapas aa gaya."
+            msg += f"\n❌ Nahi mile: {', '.join(map(str, missing))}"
+            if total is not None:
+                msg += f" (is show me sirf {total} episode hain)"
         await bot.send_message(chat, msg, reply_to=reply_to)
     return job
 
